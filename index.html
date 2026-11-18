@@ -171,11 +171,11 @@ footer{text-align:center;font-size:11.5px;color:var(--dim);padding:24px 16px 34p
 <div class="modal" id="modal">
   <div class="sheet">
     <h3>Data source</h3>
-    <p><b>Live (free)</b> uses SportScore — no key, no daily limit worth worrying about. <b>CricketData key</b> adds full batting/bowling scorecards (100 hits/day free, from <a href="https://cricketdata.org" target="_blank" rel="noopener">cricketdata.org</a>). <b>Demo</b> is a ball-by-ball simulation.</p>
+    <p><b>Live (free)</b>: match list from SportScore + live scores &amp; scorecards from CricketData (100 free updates/day, used sparingly). <b>CricketData key</b>: CricketData only. <b>Demo</b>: simulation.</p>
     <div class="fld"><label>Mode</label>
       <div class="seg" id="modeSeg"><button data-m="ss">Live (free)</button><button data-m="api">CricketData key</button><button data-m="demo">Demo</button></div>
     </div>
-    <div class="fld"><label>CricketData.org API key (only for “CricketData key” mode)</label><input id="keyIn" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off"></div>
+    <div class="fld"><label>CricketData.org API key (built in — change only if you get a new one)</label><input id="keyIn" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off"></div>
     <div class="fld"><label>Refresh every</label>
       <select id="ivIn"><option value="10000">10 seconds</option><option value="15000" selected>15 seconds</option><option value="30000">30 seconds</option><option value="15000">15 seconds</option><option value="60000">1 minute (saves API quota)</option></select>
     </div>
@@ -377,6 +377,7 @@ const SHORT=n=>({India:'IND',Australia:'AUS',England:'ENG','South Africa':'SA','
 async function apiGet(path){
   const r=await fetch(`https://api.cricapi.com/v1/${path}${path.includes('?')?'&':'?'}apikey=${encodeURIComponent(S.key)}`);
   const j=await r.json();
+  if(j.info&&j.info.hitsLimit)S.hits={used:j.info.hitsToday,limit:j.info.hitsLimit};
   if(j.status!=='success')throw new Error(j.reason||j.status||'API error');
   return j;
 }
@@ -388,7 +389,7 @@ function catOf(x){
 }
 function mapApiMatch(x,old){
   const teams=(x.teams||['TBA','TBA']).map(n=>({name:n,s:(x.teamInfo||[]).find(t=>t.name===n)?.shortname||SHORT(n)}));
-  const m=old||{id:x.id,api:true,com:[],inn:[]};
+  const m=old||{id:x.id,cdId:x.id,api:true,com:[],inn:[]};m.cdRaw=x;
   Object.assign(m,{series:x.name,format:(x.matchType||'').toUpperCase().replace('ODI','ODI').replace('TEST','Test')||'—',cat:catOf(x),venue:x.venue,teams,
     status:x.status,live:x.matchStarted&&!x.matchEnded,ended:x.matchEnded,date:x.dateTimeGMT||x.date});
   const sc=x.score||[];
@@ -403,14 +404,16 @@ async function apiRefresh(){
   if(S.open){const m=S.matches.find(x=>x.id===S.open);if(m)await apiScorecard(m)}
 }
 async function apiScorecard(m){
+  const id=m.cdId||m.id;
   try{
-    const j=await apiGet('match_scorecard?id='+m.id);const d=j.data||{};
+    const j=await apiGet('match_scorecard?id='+id);const d=j.data||{};
     if(d.tossWinner)m.toss=`${d.tossWinner} won the toss and chose to ${d.tossChoice}`;
     m.cards=(d.scorecard||[]).map(c=>({label:c.inning,
       bat:(c.batting||[]).map(b=>({n:b.batsman?.name||'',r:b.r,b:b.b,f:b['4s'],s:b['6s'],out:b['dismissal-text']==='batting'?null:b['dismissal-text'],st:b['dismissal-text']==='batting'?'bat':'out'})),
       bowl:(c.bowling||[]).map(b=>({n:b.bowler?.name||'',b:balls(b.o),m:b.m,r:b.r,w:b.w})),
       ext:c.extras||{},tot:c.totals||{}}));
-  }catch(e){m.cardErr=e.message}
+    S.cardCache[id]={t:Date.now(),cards:m.cards,toss:m.toss||'',score:d.score,status:d.status};m.cardErr='';
+  }catch(e){m.cardErr=e.message;S.cardCache[id]=Object.assign({},S.cardCache[id],{t:Date.now(),err:e.message})}
 }
 
 
@@ -434,7 +437,7 @@ function mapSS(x,i){
   const upcoming=st?/upcoming|scheduled|not_?started|fixture/.test(st):false;
   const live=!ended&&!upcoming&&(st?/live|progress|playing|innings|break/.test(st):true);
   const fake={teams:[home,away],name:comp};
-  const m={id:'ss'+(x.id??x.match_id??x.slug??i),ss:true,api:true,com:[],inn:[],
+  const m={id:'ss'+(x.id??x.match_id??x.url??x.slug??i),ss:true,api:true,com:[],inn:[],
     series:comp?comp+(x.round?` · ${nmOf(x.round)}`:''):'Cricket',
     format:(String(x.format||x.match_type||x.type||'').toUpperCase().replace('TEST','Test'))||'Cricket',
     cat:catOf(fake),venue:nmOf(x.venue)||x.stadium||'',teams:[{name:home,s:SHORT(home)},{name:away,s:SHORT(away)}],
@@ -444,15 +447,72 @@ function mapSS(x,i){
   m.apiScore=sc.map((t,ti)=>{const p=parseScore(t)||{};return{team:ti,label:[home,away][ti],...p}});
   return m;
 }
-async function tickSS(){
+/* ---- hybrid: SportScore list + CricketData live scores (saves free hits) ---- */
+const LIST_TTL=180000, CARD_TTL=120000;
+async function cdList(force){
+  let c=null;try{c=JSON.parse(store.get('cl_cdlist','null'))}catch(e){}
+  if(!force&&c&&Date.now()-c.t<LIST_TTL){S.cdListT=c.t;return c.data}
+  if(!S.key)return c?c.data:[];
+  try{const j=await apiGet('currentMatches?offset=0');c={t:Date.now(),data:j.data||[]};store.set('cl_cdlist',JSON.stringify(c));S.cdErr=''}
+  catch(e){S.cdErr=e.message;if(c){c.t=Date.now()-LIST_TTL+60000;store.set('cl_cdlist',JSON.stringify(c))}}
+  S.cdListT=c?c.t:0;return c?c.data:[];
+}
+const normT=s=>String(s||'').toLowerCase().replace(/\bwomen\b/g,' w ').replace(/[^a-z ]/g,' ').replace(/\s+/g,' ').trim();
+const sameTeam=(a,b)=>{a=normT(a);b=normT(b);return!!a&&!!b&&(a===b||a.startsWith(b+' ')&&!/ (a|w)$/.test(a)||b.startsWith(a+' ')&&!/ (a|w)$/.test(b))};
+function attachCD(m,x){
+  m.cdId=x.id;m.cdRaw=x;m.cd=true;m.api=true;
+  const c=S.cardCache[x.id];const fresh=c&&c.score&&c.t>(S.cdListT||0);
+  const sc=fresh?c.score:(x.score||[]);
+  m.apiScore=sc.map(s=>{const lab=String(s.inning||'').replace(/\s+inning.*$/i,'');let ti=m.teams.findIndex(t=>sameTeam(lab,t.name));return{team:ti<0?0:ti,label:s.inning,runs:s.r,wkts:s.w,balls:balls(s.o)}});
+  m.scoreTxt=m.teams.map((t,i)=>m.apiScore.filter(e=>e.team===i).map(e=>`${e.runs}${e.wkts<10?'/'+e.wkts:''} (${ov(e.balls)})`).join(' & '));
+  const st=(fresh&&c.status)||x.status;if(st)m.status=st;
+  m.live=!!(x.matchStarted&&!x.matchEnded);m.ended=!!x.matchEnded;m.upcoming=!x.matchStarted;
+  if(x.matchType)m.format=x.matchType.toUpperCase().replace('TEST','Test');
+  if(x.venue)m.venue=x.venue;
+  if(c){m.cards=c.cards;m.toss=c.toss||m.toss;m.cardErr=c.err}
+  return m;
+}
+function mergeCD(ms,cd){
+  cd.forEach(x=>{
+    const t=x.teams||[];if(t.length<2)return;
+    const m=ms.find(m=>!m.cd&&((sameTeam(m.teams[0].name,t[0])&&sameTeam(m.teams[1].name,t[1]))||(sameTeam(m.teams[0].name,t[1])&&sameTeam(m.teams[1].name,t[0]))));
+    if(m)attachCD(m,x);
+    else if(x.matchStarted&&!x.matchEnded)ms.push(attachCD(mapApiMatch(x),x));
+  });
+  return ms;
+}
+let ssBusy=false;
+async function tickSS(force){
+  if((document.hidden&&!force)||ssBusy)return;ssBusy=true;
   try{
-    const r=await fetch('https://sportscore.com/api/widget/matches/?sport=cricket&limit=50&src=creaselive');
-    if(!r.ok)throw new Error('SportScore returned '+r.status);
-    const j=await r.json();const arr=j.matches||j.data||j.results||(Array.isArray(j)?j:[]);
-    S.matches=arr.map(mapSS);S.err='';S.ssUpdated=j.updated||'';
-    if(!arr.length)S.err='SportScore has no cricket matches listed right now.';
-  }catch(e){S.err=(e.message||'Network error')+'. If this keeps happening, switch to “CricketData key” in ⚙.'}
+    try{
+      const r=await fetch('https://sportscore.com/api/widget/matches/?sport=cricket&limit=50&src=creaselive');
+      if(!r.ok)throw new Error('SportScore returned '+r.status);
+      const j=await r.json();S.lastSS=j.matches||j.data||j.results||(Array.isArray(j)?j:[]);S.err='';S.ssUpdated=j.updated||'';
+    }catch(e){S.err=(e.message||'Network error')+' (match list).';S.lastSS=S.lastSS||[]}
+    const cd=await cdList(force&&!S.open);
+    S.matches=mergeCD(S.lastSS.map(mapSS),cd);
+    if(S.open){
+      const m=S.matches.find(x=>x.id===S.open);
+      if(m&&m.cdId&&m.live!==false){const c=S.cardCache[m.cdId];if(force||!c||Date.now()-c.t>CARD_TTL){await apiScorecard(m);attachCD(m,m.cdRaw)}}
+    }
+    if(!S.matches.length&&!S.err)S.err='No cricket matches listed right now.';
+  }finally{ssBusy=false}
   S.loading=false;S.last=performance.now();render();
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&S.mode==='ss')tickSS()});
+function refreshBar(){
+  const left=S.hits?Math.max(0,S.hits.limit-S.hits.used):null;
+  return`<div class="ovsum" style="margin:0 0 12px;display:flex;justify-content:space-between;align-items:center;gap:10px"><span style="color:var(--mut)">Auto-refresh every ${S.open?'2':'3'} min</span>${refreshBtn()}</div>`;
+}
+function refreshBtn(){
+  const left=S.hits?Math.max(0,S.hits.limit-S.hits.used):null;
+  return`<button class="dtab on" id="refreshNow" style="flex:none;${left===0?'opacity:.5':''}">↻ Refresh${left!=null?` · ${left} left`:''}</button>`;
+}
+function cdLive(m){
+  const c=m.cards&&m.cards.length?m.cards[m.cards.length-1]:null;
+  return refreshBar()+(c?apiCardHtml(c):`<div class="panel"><div class="empty">${m.cardErr?esc(m.cardErr):'Loading live scorecard…'}</div></div>`)+
+   `<div class="panel"><div class="empty" style="padding:16px">Ball-by-ball commentary isn't in the free plan. Full scorecard of both innings → Scorecard tab.</div></div>`;
 }
 function ssDetail(m){
   const rows=m.teams.map((t,i)=>`<div class="rowx"><b>${esc(t.name)}</b><b class="mono">${esc(m.scoreTxt[i]||'Yet to bat')}</b></div>`).join('');
@@ -463,7 +523,8 @@ function ssDetail(m){
 }
 
 /* ============ state ============ */
-const S={mode:store.get('cl_mode2','ss'),key:store.get('cl_key',''),iv:+store.get('cl_iv',15000),cat:'all',open:null,dtab:'live',matches:[],last:performance.now(),err:'',quota:'',openInn:{}};
+const BUILTIN_KEY='354c415e-66be-49ed-9ef5-0eeff0209270';
+const S={cardCache:{},hits:null,mode:store.get('cl_mode2','ss'),key:store.get('cl_key','')||BUILTIN_KEY,iv:+store.get('cl_iv',15000),cat:'all',open:null,dtab:'live',matches:[],last:performance.now(),err:'',quota:'',openInn:{}};
 
 /* ============ derived numbers ============ */
 const cur=m=>m.inn[m.inn.length-1];
@@ -528,7 +589,7 @@ function renderList(){
   const ms=S.matches.filter(m=>S.cat==='all'||m.cat===S.cat);
   const live=ms.filter(m=>m.live),rest=ms.filter(m=>!m.live).sort((a,b)=>(b.upcoming?1:0)-(a.upcoming?1:0));
   $('#app').innerHTML=`${banner()}
-   <div class="ticker"><span>${live.length} live · ${rest.length} other</span><span>Updated <span class="ms mono" id="msAgo">0 ms</span> ago</span></div>
+   <div class="ticker"><span>${live.length} live · ${rest.length} other · updated <span class="ms mono" id="msAgo">0 ms</span> ago</span>${S.mode==='ss'?refreshBtn():''}</div>
    ${!ms.length?`<div class="empty">${S.err?esc(S.err):'No matches in this category right now.'}</div>`:''}
    ${live.length?`<div class="sec">Live now</div><div class="grid">${live.map(card).join('')}</div>`:''}
    ${rest.length?`<div class="sec">Recent & upcoming</div><div class="grid">${rest.map(card).join('')}</div>`:''}`;
@@ -536,7 +597,7 @@ function renderList(){
 function banner(){
   if(S.mode==='demo')return`<div class="banner"><b>Demo mode:</b> AUS v ENG starts from your screenshot (113-4 in 25.2) and continues as a simulation; other fixtures are invented. Tap ⚙ to switch to real live scores with a free API key.</div>`;
   if(S.err)return`<div class="banner"><b>Couldn't load live data:</b> ${esc(S.err)}</div>`;
-  if(S.mode==='ss')return`<div class="banner" style="background:#e9f9f2;border-color:#bfead6;color:#145c42">${S.loading?'Loading matches…':`SportScore free feed · data as of <b style="color:inherit">${S.ssUpdated?fmtTime(S.ssUpdated)+' ('+agoTxt(S.ssUpdated)+')':'—'}</b>. Live scores in progress aren't in this feed — use a CricketData key (⚙) for real-time scores.`}</div>`;
+  if(S.mode==='ss')return`<div class="banner" style="background:#e9f9f2;border-color:#bfead6;color:#145c42">${S.loading?'Loading matches…':`Live scores update every 3 min (open a match for 2-min updates + full scorecard)${S.hits?` · <b style="color:inherit">${Math.max(0,S.hits.limit-S.hits.used)}</b> free updates left today`:''}${S.cdErr?` · <span style="color:var(--wk)">${esc(S.cdErr)}</span>`:''}`}</div>`;
   return S.quota?`<div class="banner" style="background:#e9f9f2;border-color:#bfead6;color:#145c42">Live from CricketData.org · ${esc(S.quota)}</div>`:'';
 }
 
@@ -552,10 +613,10 @@ function renderDetail(){
 }
 function hero(m){
   if(m.api){
-    const s=m.ss?(()=>{const v=m.apiScore.filter(x=>x.runs!=null);return v.find(x=>x.balls!=null&&x.wkts!==10)||v.find(x=>(m.status||'').toLowerCase().includes(x.label.toLowerCase()))||v[v.length-1]})():m.apiScore[m.apiScore.length-1];
+    const s=m.cd?m.apiScore[m.apiScore.length-1]:m.ss?(()=>{const v=m.apiScore.filter(x=>x.runs!=null);return v.find(x=>x.balls!=null&&x.wkts!==10)||v.find(x=>(m.status||'').toLowerCase().includes(x.label.toLowerCase()))||v[v.length-1]})():m.apiScore[m.apiScore.length-1];
     return`<div class="hero"><div class="need ${m.ended?'ok':''}">${esc(m.status)}</div>
       <div class="big"><div><div class="t">${esc(s?m.teams[s.team].s:'')}</div><div class="s mono">${s?`${s.runs}${s.wkts!=null?'-'+s.wkts:''}${s.balls!=null?`<small>(${ov(s.balls)})</small>`:''}`:'—'}</div></div>
-      <div class="stats">${s&&s.balls?`<div><label>CRR</label><b>${(s.runs*6/s.balls).toFixed(2)}</b></div>`:''}</div></div>
+      <div class="stats">${s&&s.balls?`<div><label>CRR</label><b>${(s.runs*6/s.balls).toFixed(2)}</b></div>`:''}${(()=>{const mo={ODI:50,T20:20,T10:10}[m.format];if(!m.cd||!m.live||!mo||m.apiScore.length!==2)return'';const tg=m.apiScore[0].runs+1,bl=mo*6-s.balls;return bl>0?`<div><label>RRR</label><b>${((tg-s.runs)*6/bl).toFixed(2)}</b></div><div><label>TAR</label><b>${tg}</b></div>`:''})()}</div></div>
       <div class="other">${m.ss?m.teams.map((t,i)=>m.scoreTxt[i]?`${esc(t.name)}: ${esc(m.scoreTxt[i])}`:'').filter(Boolean).join(' · '):m.apiScore.slice(0,-1).map(x=>`${esc(x.label)}: ${x.runs}-${x.wkts} (${ov(x.balls)})`).join(' · ')}</div></div>`;
   }
   const inn=cur(m),c=chaseInfo(m),st=statusLine(m),wp=winProb(m),p=projected(m);
@@ -571,6 +632,7 @@ function hero(m){
   </div>`;
 }
 function liveTab(m){
+  if(m.cdId)return cdLive(m);
   if(m.ss)return ssDetail(m);
   if(m.api)return`<div class="panel"><div class="empty">Ball-by-ball commentary isn't included in the CricketData.org free plan. See the Scorecard tab for full batting & bowling.</div></div>`;
   const inn=cur(m);
@@ -610,20 +672,23 @@ function inningsCard(m,inn,idx){
    </table>`:''}</div>`;
 }
 function cardTab(m){
-  if(m.ss)return ssDetail(m);
+  if(m.ss&&!m.cdId)return ssDetail(m);
   if(m.api){
     if(!m.cards)return`<div class="panel"><div class="empty">${m.cardErr?esc(m.cardErr):'Loading scorecard…'}</div></div>`;
     if(!m.cards.length)return`<div class="panel"><div class="empty">Scorecard not available yet.</div></div>`;
-    return m.cards.map(c=>`<div class="panel"><div class="ph"><span>${esc(c.label)}</span><span class="mono">${c.tot.R??''}${c.tot.W!=null?'-'+c.tot.W:''} ${c.tot.O!=null?'('+c.tot.O+')':''}</span></div>
-      <table><tr><th>Batter</th><th>R</th><th>B</th><th>4s</th><th>6s</th><th>SR</th></tr>${c.bat.map(b=>`<tr><td><span class="nm ${b.st==='bat'?'on':''}">${esc(b.n)}</span><span class="dis">${esc(b.out||'batting')}</span></td><td><b>${b.r}</b></td><td>${b.b}</td><td>${b.f}</td><td>${b.s}</td><td>${sr(b.r,b.b)}</td></tr>`).join('')}</table>
-      <div class="rowx"><b>Extras</b><span>${esc(c.ext.r??'')}</span></div>
-      <table><tr><th>Bowler</th><th>O</th><th>M</th><th>R</th><th>W</th><th>ER</th></tr>${c.bowl.map(b=>`<tr><td><span class="nm">${esc(b.n)}</span></td><td>${ov(b.b)}</td><td>${b.m}</td><td>${b.r}</td><td><b>${b.w}</b></td><td>${eco(b.r,b.b)}</td></tr>`).join('')}</table></div>`).join('');
+    return (m.cdId?refreshBar():'')+m.cards.map(apiCardHtml).reverse().join('');
   }
   return m.inn.map((inn,i)=>inningsCard(m,inn,i)).reverse().join('');
 }
+function apiCardHtml(c){
+    return `<div class="panel"><div class="ph"><span>${esc(c.label)}</span><span class="mono">${c.tot.R??''}${c.tot.W!=null?'-'+c.tot.W:''} ${c.tot.O!=null?'('+c.tot.O+')':''}</span></div>
+      <table><tr><th>Batter</th><th>R</th><th>B</th><th>4s</th><th>6s</th><th>SR</th></tr>${c.bat.map(b=>`<tr><td><span class="nm ${b.st==='bat'?'on':''}">${esc(b.n)}</span><span class="dis">${esc(b.out||'batting')}</span></td><td><b>${b.r}</b></td><td>${b.b}</td><td>${b.f}</td><td>${b.s}</td><td>${sr(b.r,b.b)}</td></tr>`).join('')}</table>
+      <div class="rowx"><b>Extras</b><span>${esc(c.ext.r??'')}</span></div>
+      <table><tr><th>Bowler</th><th>O</th><th>M</th><th>R</th><th>W</th><th>ER</th></tr>${c.bowl.map(b=>`<tr><td><span class="nm">${esc(b.n)}</span></td><td>${ov(b.b)}</td><td>${b.m}</td><td>${b.r}</td><td><b>${b.w}</b></td><td>${eco(b.r,b.b)}</td></tr>`).join('')}</table></div>`;
+}
 function overRuns(o){return o.reduce((a,x)=>a+(x==='W'?0:x==='Wd'||x==='Nb'?1:+x),0)}
 function oversTab(m){
-  if(m.ss)return`<div class="panel"><div class="empty">Over-by-over charts aren't in the free SportScore feed.</div></div>`;
+  if(m.ss||m.api)return`<div class="panel"><div class="empty">Over-by-over charts aren't in the free SportScore feed.</div></div>`;
   if(m.api)return`<div class="panel"><div class="empty">Over-by-over data isn't included in the free API plan.</div></div>`;
   const W=640,H=200,P=28,cols=[teamBg(m.teams[0].s,0),teamBg(m.teams[1].s,1)];
   const solid=['#00a374','#0284c7'];
@@ -684,9 +749,9 @@ async function tickApi(){
 function start(){
   clearInterval(timer);
   $('#modeTxt').textContent=S.mode==='demo'?'Demo':'Live';
-  $('#srcTxt').textContent=S.mode==='demo'?'Demo simulation':S.mode==='ss'?'Data: SportScore':'Data: CricketData.org';
+  $('#srcTxt').textContent=S.mode==='demo'?'Demo simulation':S.mode==='ss'?'Data: SportScore + CricketData.org':'Data: CricketData.org';
   if(S.mode==='demo'){S.matches=buildDemo();render();timer=setInterval(tickDemo,1800)}
-  else if(S.mode==='ss'){S.matches=[];S.loading=true;render();tickSS();timer=setInterval(tickSS,Math.max(10000,S.iv))}
+  else if(S.mode==='ss'){S.matches=[];S.loading=true;render();tickSS(false);timer=setInterval(()=>tickSS(false),Math.max(10000,S.iv))}
   else{S.matches=[];render();tickApi();timer=setInterval(tickApi,Math.max(1000,S.iv))}
 }
 // millisecond "updated ago" ticker
@@ -695,7 +760,8 @@ function start(){
 /* ============ events ============ */
 document.addEventListener('click',async e=>{
   const t=e.target.closest('[data-c]');if(t){S.cat=t.dataset.c;S.open=null;render();window.scrollTo({top:0,behavior:'smooth'});return}
-  const c=e.target.closest('.mc');if(c){S.open=c.dataset.id;S.dtab='live';render();window.scrollTo({top:0});const m=S.matches.find(x=>x.id===S.open);if(m?.api){await apiScorecard(m);render()}return}
+  const c=e.target.closest('.mc');if(c){S.open=c.dataset.id;S.dtab='live';render();window.scrollTo({top:0});const m=S.matches.find(x=>x.id===S.open);if(m?.cdId){const c=S.cardCache[m.cdId];if(!c||Date.now()-c.t>CARD_TTL){await apiScorecard(m);if(m.cdRaw&&S.mode==='ss')attachCD(m,m.cdRaw)}render()}return}
+  if(e.target.closest('#refreshNow')){const b=e.target.closest('#refreshNow');b.textContent='Refreshing…';S.mode==='ss'?tickSS(true):S.mode==='api'?tickApi():null;return}
   if(e.target.closest('#backBtn')){S.open=null;render();return}
   const d=e.target.closest('[data-t]');if(d){S.dtab=d.dataset.t;render();return}
   const a=e.target.closest('[data-inn]');if(a){const k=S.open+a.dataset.inn;const m=S.matches.find(x=>x.id===S.open);S.openInn[k]=!(S.openInn[k]??(+a.dataset.inn===m.inn.length-1));render();return}
