@@ -450,12 +450,31 @@ function mapSS(x,i){
 /* ---- hybrid: SportScore list + CricketData live scores (saves free hits) ---- */
 const LIST_TTL=180000, CARD_TTL=120000;
 async function cdList(force){
-  let c=null;try{c=JSON.parse(store.get('cl_cdlist','null'))}catch(e){}
+  let c=null;try{c=JSON.parse(store.get('cl_cdlist2','null'))}catch(e){}
   if(!force&&c&&Date.now()-c.t<LIST_TTL){S.cdListT=c.t;return c.data}
   if(!S.key)return c?c.data:[];
-  try{const j=await apiGet('currentMatches?offset=0');c={t:Date.now(),data:j.data||[]};store.set('cl_cdlist',JSON.stringify(c));S.cdErr=''}
-  catch(e){S.cdErr=e.message;if(c){c.t=Date.now()-LIST_TTL+60000;store.set('cl_cdlist',JSON.stringify(c))}}
+  try{let data;
+    try{const j=await apiGet('cricScore');data=(j.data||[]).map(fromCricScore)}
+    catch(e1){const j=await apiGet('currentMatches?offset=0');data=j.data||[]}
+    c={t:Date.now(),data};store.set('cl_cdlist2',JSON.stringify(c));S.cdErr=''}
+  catch(e){S.cdErr=e.message;if(c){c.t=Date.now()-LIST_TTL+60000;store.set('cl_cdlist2',JSON.stringify(c))}}
   S.cdListT=c?c.t:0;return c?c.data:[];
+}
+
+// cricScore: one hit returns every current match ({t1:"Australia [AUS]", t1s:"173/6 (35.3)", ms:"live"|"result"|"fixture", ...})
+function fromCricScore(x){
+  const nm=t=>String(t||'').replace(/\s*\[[^\]]*\]\s*$/,'').trim(), sh=t=>(String(t||'').match(/\[([^\]]+)\]/)||[])[1];
+  const T=[nm(x.t1),nm(x.t2)],S2=[x.t1s||'',x.t2s||''];
+  const segs=i=>String(S2[i]).split('&').map(z=>z.trim()).filter(Boolean).map(z=>{const m=z.match(/(\d+)(?:\/(\d+))?(?:\s*\(([\d.]+))?/);return m?{r:+m[1],w:m[2]!=null?+m[2]:10,o:m[3]?+m[3]:0,inning:T[i]+' Inning'}:null}).filter(Boolean);
+  const st=String(x.status||'').toLowerCase();
+  let cur=-1;const has=[segs(0).length,segs(1).length];
+  if(has[0]&&!has[1])cur=0;else if(has[1]&&!has[0])cur=1;
+  else if(has[0]&&has[1]){cur=T.findIndex(t=>st.startsWith(t.toLowerCase())&&/need|require|trail|lead/.test(st));if(cur<0)cur=segs(0).slice(-1)[0].w<10&&segs(1).slice(-1)[0].w>=10?0:1}
+  const a=segs(cur===0?1:0),b=segs(cur===0?0:1);
+  const score=[];for(let k=0;k<Math.max(a.length,b.length);k++){if(a[k])score.push(a[k]);if(b[k])score.push(b[k])}
+  return{id:x.id,name:x.series||'',series:x.series,matchType:x.matchType,status:x.status,teams:T,
+    teamInfo:[{name:T[0],shortname:sh(x.t1),img:x.t1img},{name:T[1],shortname:sh(x.t2),img:x.t2img}],
+    score,matchStarted:x.ms!=='fixture',matchEnded:x.ms==='result',dateTimeGMT:x.dateTimeGMT};
 }
 const normT=s=>String(s||'').toLowerCase().replace(/\bwomen\b/g,' w ').replace(/[^a-z ]/g,' ').replace(/\s+/g,' ').trim();
 const sameTeam=(a,b)=>{a=normT(a);b=normT(b);return!!a&&!!b&&(a===b||a.startsWith(b+' ')&&!/ (a|w)$/.test(a)||b.startsWith(a+' ')&&!/ (a|w)$/.test(b))};
